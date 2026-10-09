@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "cityflo-lateness": {
+      "type": "local",
+      "command": ["/home/codespace/.python/current/bin/python3", "-m", "server"],
+      "cwd": "/workspaces/cityflow-ai-engineer-assignment",
+      "enabled": true
+    }
+  }
+}
