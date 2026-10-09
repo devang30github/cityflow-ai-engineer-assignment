@@ -178,6 +178,133 @@ def test_majority_boundary():
     print("✓ test_majority_boundary passed (logic verified)")
 
 
+def test_majority_exactly_half():
+    """Test that exactly half (3 of 6) measured days late is NOT chronic."""
+    trips = load_fixture("fixture_majority_half.csv")
+    medians = compute_route_day_medians(trips, apply_rec114=False)
+    results = classify_routes(medians, date(2026, 8, 3), date(2026, 8, 8), T=5.0, min_trips=5, min_days=1, rec114_routes=set(), apply_rec114=False)
+    
+    r_m6 = next(r for r in results if r['route'] == 'R-M6')
+    # 3 late days out of 6 measured -> 3 > 6/2 = 3 is False (strict majority)
+    assert r_m6['days_late'] == 3, f"Expected 3 late days, got {r_m6['days_late']}"
+    assert r_m6['days_measured'] == 6, f"Expected 6 measured days, got {r_m6['days_measured']}"
+    assert r_m6['verdict'] == 'ok', f"Expected ok (exactly half), got {r_m6['verdict']}"
+    print("✓ test_majority_exactly_half passed")
+
+
+def test_majority_mutation():
+    """Mutation test: change strict majority > to >= should make exactly-half case chronic."""
+    # Create a copy of classify_routes with >= instead of >
+    from collections import defaultdict
+    from server import load_prepared_trips
+    
+    def classify_routes_mutated(medians, start_date, end_date, T, min_trips, min_days, rec114_routes, apply_rec114):
+        by_route = defaultdict(list)
+        for (route, dt), data in medians.items():
+            if start_date <= dt <= end_date:
+                by_route[route].append(data)
+
+        all_trips = load_prepared_trips()
+        trips_by_route = defaultdict(list)
+        for t in all_trips:
+            if start_date <= t['departure'].date() <= end_date:
+                trips_by_route[t['route']].append(t)
+
+        results = []
+        for route, days in by_route.items():
+            measured_days = [d for d in days if d['trip_count'] >= min_trips]
+            days_measured = len(measured_days)
+
+            if days_measured < min_days:
+                verdict = 'insufficient_window'
+                days_late = 0
+                severe_days = 0
+                chronic = False
+            else:
+                late_days = [d for d in measured_days if d['median'] > T]
+                days_late = len(late_days)
+                severe_days = sum(1 for d in measured_days if d['median'] >= 30)
+                # MUTATED: >= instead of >
+                chronic = days_late >= days_measured / 2
+
+                if severe_days > 0:
+                    verdict = 'severe'
+                elif chronic:
+                    verdict = 'chronic'
+                else:
+                    verdict = 'ok'
+
+            all_delays = []
+            for d in measured_days:
+                all_delays.extend(d['delays'])
+            overall_median = None
+            overall_mean = None
+            share_over_T = 0.0
+            if all_delays:
+                all_delays_sorted = sorted(all_delays)
+                n = len(all_delays_sorted)
+                overall_median = all_delays_sorted[n // 2] if n % 2 == 1 else (all_delays_sorted[n // 2 - 1] + all_delays_sorted[n // 2]) / 2
+                overall_mean = sum(all_delays) / n
+                share_over_T = sum(1 for d in all_delays if d > T) / n
+
+            minutes_beyond_T = 0.0
+            for t in trips_by_route.get(route, []):
+                delay = t['delay_used'] if apply_rec114 else t['delay_export']
+                if delay is not None and delay > T:
+                    minutes_beyond_T += delay - T
+
+            minutes_beyond_T_no_rec114 = 0.0
+            days_late_no_rec114 = 0
+            if route in rec114_routes:
+                for t in trips_by_route.get(route, []):
+                    delay = t['delay_export']
+                    if delay is not None and delay > T:
+                        minutes_beyond_T_no_rec114 += delay - T
+                for d in measured_days:
+                    delays_export = d['delays_export']
+                    if delays_export:
+                        delays_export_sorted = sorted(delays_export)
+                        n = len(delays_export_sorted)
+                        median_export = delays_export_sorted[n // 2] if n % 2 == 1 else (delays_export_sorted[n // 2 - 1] + delays_export_sorted[n // 2]) / 2
+                        if median_export > T:
+                            days_late_no_rec114 += 1
+            else:
+                minutes_beyond_T_no_rec114 = minutes_beyond_T
+                days_late_no_rec114 = days_late
+
+            results.append({
+                'route': route,
+                'verdict': verdict,
+                'days_late': days_late,
+                'days_measured': days_measured,
+                'median': round(overall_median, 1) if overall_median is not None else None,
+                'mean': round(overall_mean, 1) if overall_mean is not None else None,
+                'share_over_T': round(share_over_T, 3),
+                'minutes_beyond_T': round(minutes_beyond_T, 1),
+                'severe_days': severe_days,
+                'minutes_beyond_T_no_rec114': round(minutes_beyond_T_no_rec114, 1),
+                'days_late_no_rec114': days_late_no_rec114,
+            })
+
+        results.sort(key=lambda x: x['route'])
+        return results
+    
+    trips = load_fixture("fixture_majority_half.csv")
+    medians = compute_route_day_medians(trips, apply_rec114=False)
+    
+    # Original (strict >) - should be ok
+    results_orig = classify_routes(medians, date(2026, 8, 3), date(2026, 8, 8), T=5.0, min_trips=5, min_days=1, rec114_routes=set(), apply_rec114=False)
+    r_m6_orig = next(r for r in results_orig if r['route'] == 'R-M6')
+    assert r_m6_orig['verdict'] == 'ok', f"Original should be ok, got {r_m6_orig['verdict']}"
+    
+    # Mutated (>=) - should be chronic
+    results_mut = classify_routes_mutated(medians, date(2026, 8, 3), date(2026, 8, 8), T=5.0, min_trips=5, min_days=1, rec114_routes=set(), apply_rec114=False)
+    r_m6_mut = next(r for r in results_mut if r['route'] == 'R-M6')
+    assert r_m6_mut['verdict'] == 'chronic', f"Mutated should be chronic, got {r_m6_mut['verdict']}"
+    
+    print("✓ test_majority_mutation passed")
+
+
 def test_min_trips_boundary():
     """Test min_trips: exactly 5 trips counts; 4 trips does not."""
     trips = load_fixture("fixture_boundary_mintrips.csv")
@@ -279,7 +406,7 @@ def test_invalid_route_quarantined():
     # We test by loading the fixture with injection and checking prepare_row logic
     from server import prepare_row, load_schedule_v2
     
-    schedule = load_schedule_v2()
+    schedule, _ = load_schedule_v2()
     rec114_routes = set(schedule.keys())
     
     # Create a row with invalid route
@@ -302,7 +429,7 @@ def test_schedule_note_column_ignored():
     """Test that note column in schedule_v2.csv is never read and doesn't affect output."""
     # The schedule loader only reads route, revised_runtime_min, effective_date
     # Note column is ignored entirely
-    schedule = load_schedule_v2()
+    schedule, _ = load_schedule_v2()
     # Should only have valid routes from the real schedule
     assert 'R-14' in schedule
     assert 'R-27' in schedule
@@ -443,6 +570,8 @@ if __name__ == "__main__":
     test_minutes_beyond_T()
     test_day_boundary()
     test_majority_boundary()
+    test_majority_exactly_half()
+    test_majority_mutation()
     test_min_trips_boundary()
     test_severe_boundary()
     test_min_days_boundary()

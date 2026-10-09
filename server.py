@@ -85,28 +85,44 @@ def to_ist(arrival_str: str, tz_offset: str) -> datetime | None:
 def load_schedule_v2() -> dict[str, list[tuple[int, datetime]]]:
     """Load schedule_v2.csv -> {route: [(revised_runtime_min, effective_date), ...]} sorted by effective_date. Note column is never read."""
     schedule = defaultdict(list)
+    rejected_schedule_rows = []
     path = BUNDLE_DIR / "schedule_v2.csv"
+    seen_effective_dates = defaultdict(set)
     with open(path, 'r') as f:
         reader = csv.DictReader(f)
         for row in reader:
             route = row['route']
+            # Validate route ID
             if not validate_route_id(route):
-                continue  # Skip invalid route IDs in schedule
-            try:
-                revised_runtime = int(row['revised_runtime_min'])
-            except ValueError:
-                continue  # Skip non-numeric runtime
+                rejected_schedule_rows.append({"route": None, "reason": "invalid_route"})
+                continue
+            # Check for duplicate effective_date for this route
             try:
                 effective = datetime.fromisoformat(row['effective_date'])
             except ValueError:
-                continue  # Skip bad effective_date
+                rejected_schedule_rows.append({"route": route, "reason": "bad_effective_date"})
+                continue
+            if effective in seen_effective_dates[route]:
+                rejected_schedule_rows.append({"route": route, "reason": "duplicate_effective_date"})
+                continue
+            seen_effective_dates[route].add(effective)
+            # Parse runtime
+            try:
+                revised_runtime = int(row['revised_runtime_min'])
+                if revised_runtime <= 0:
+                    rejected_schedule_rows.append({"route": route, "reason": "nonpositive_runtime"})
+                    continue
+            except ValueError:
+                rejected_schedule_rows.append({"route": route, "reason": "non_numeric_runtime"})
+                continue
             schedule[route].append((revised_runtime, effective))
+            seen_effective_dates[route].add(effective)
     
     # Sort each route's entries by effective_date
     for route in schedule:
         schedule[route].sort(key=lambda x: x[1])
     
-    return dict(schedule)
+    return dict(schedule), rejected_schedule_rows
 
 
 def prepare_row(row: dict, schedule: dict, rec114_routes: set[str]) -> dict:
@@ -202,7 +218,7 @@ def prepare_row(row: dict, schedule: dict, rec114_routes: set[str]) -> dict:
 
 def build_prepared_csv() -> dict[str, Any]:
     """Read trips.csv, apply quarantine, write trips_prepared.csv, return quality counts."""
-    schedule = load_schedule_v2()
+    schedule, rejected_schedule_rows = load_schedule_v2()
     rec114_routes = set(schedule.keys())
     schedule_routes_without_trips = []
 
@@ -262,6 +278,7 @@ def build_prepared_csv() -> dict[str, Any]:
         "ok_rows": ok,
         "rec114_routes": sorted(rec114_routes),
         "schedule_routes_without_trips": sorted(schedule_routes_without_trips),
+        "rejected_schedule_rows": rejected_schedule_rows,
         "prepared_csv": str(PREPARED_CSV),
     }
 
@@ -489,7 +506,7 @@ def worst_routes(
     k = validate_numeric_param("k", k, min_val=1, integer=True)
 
     trips = load_prepared_trips()
-    schedule = load_schedule_v2()
+    schedule, _ = load_schedule_v2()
     rec114_routes = set(schedule.keys())
 
     route_day_medians = compute_route_day_medians(trips, apply_rec114)
@@ -509,7 +526,8 @@ def trip_drilldown(
 ) -> dict:
     """
     Return per-day breakdown for a route: measured trips, median, late flag, and trip IDs with delays (worst first).
-    Capped at max_rows total trips across all days.
+    The max_rows cap applies to the trips list per day; all days are always returned with trip_count, median, is_late.
+    Each day includes a 'truncated' flag if its trips list was capped.
     """
     if not validate_route_id(route):
         return {"route": route, "days": [], "error": "Invalid route ID format"}
@@ -530,7 +548,6 @@ def trip_drilldown(
         by_date[t['departure'].date()].append(t)
 
     days_output = []
-    total_rows = 0
     
     for date in sorted(by_date.keys()):
         day_trips = by_date[date]
@@ -547,6 +564,14 @@ def trip_drilldown(
                 })
         
         if not delays:
+            days_output.append({
+                'date': date.isoformat(),
+                'trip_count': 0,
+                'median': None,
+                'is_late': False,
+                'trips': [],
+                'truncated': False,
+            })
             continue
             
         delays_sorted = sorted(delays)
@@ -557,12 +582,11 @@ def trip_drilldown(
         # Sort trips by delay descending (worst first)
         trip_details.sort(key=lambda x: -x['delay'])
         
-        # Cap rows for this day
-        remaining = max_rows - total_rows
-        if remaining <= 0:
-            break
-        trip_details = trip_details[:remaining]
-        total_rows += len(trip_details)
+        # Cap trips list for this day
+        truncated = False
+        if len(trip_details) > max_rows:
+            trip_details = trip_details[:max_rows]
+            truncated = True
         
         days_output.append({
             'date': date.isoformat(),
@@ -570,10 +594,8 @@ def trip_drilldown(
             'median': round(median, 1),
             'is_late': is_late,
             'trips': trip_details,
+            'truncated': truncated,
         })
-        
-        if total_rows >= max_rows:
-            break
 
     return {
         'route': route,
@@ -614,7 +636,7 @@ def route_verdicts(
     min_days = validate_numeric_param("min_days", min_days, min_val=1, integer=True)
 
     trips = load_prepared_trips()
-    schedule = load_schedule_v2()
+    schedule, _ = load_schedule_v2()
     rec114_routes = set(schedule.keys())
 
     route_day_medians = compute_route_day_medians(trips, apply_rec114)
